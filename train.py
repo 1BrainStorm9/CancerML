@@ -74,15 +74,31 @@ class Trainer:
         """Инициализация модели, оптимизатора, загрузчиков данных."""
         print("Setting up training...")
         
+        # Проверка CUDA и автоматическая настройка
+        if self.device == 'cuda' and not torch.cuda.is_available():
+            print("\nWARNING: CUDA requested but not available. Switching to CPU.")
+            print("Training on CPU will be VERY slow (hours -> days).")
+            print("Consider using Google Colab or other GPU platforms.\n")
+            self.device = 'cpu'
+            self.mixed_precision = False  # Mixed precision не работает на CPU
+        
+        # Отключаем pin_memory для CPU
+        use_pin_memory = (self.device == 'cuda')
+        
         # DataLoaders
         self.train_loader, self.val_loader = get_dataloaders(
             data_dir=self.data_dir,
             train_split=0.8,
             batch_size=self.batch_size,
-            num_workers=self.num_workers,
+            num_workers=self.num_workers if self.device == 'cuda' else 0,  # CPU: num_workers=0
             cache_train=False,
             cache_val=False
         )
+        
+        # Обновляем pin_memory в DataLoader
+        if not use_pin_memory:
+            for loader in [self.train_loader, self.val_loader]:
+                loader.pin_memory = False
         
         # Модель
         self.model = create_model(device=self.device)

@@ -21,7 +21,8 @@ venv/
 Thumbs.db
 
 # --- Datasets and checkpoints ---
-data/LUNA16
+experiments/
+data/LUNA16/
 data/LUNA16/raw/
 data/LUNA16/**/*.mhd
 data/LUNA16/**/*.raw
