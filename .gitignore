@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.log
+
+# --- Virtual environments ---
+.venv/
+env/
+venv/
+.conda/
+*.egg-info/
+
+# --- VSCode ---
+.vscode/
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Datasets and checkpoints ---
+data/LUNA16/raw/
+data/LUNA16/**/*.mhd
+data/LUNA16/**/*.raw
+data/LUNA16/**/*.zip
+data/LUNA16/**/*.nii
+data/LUNA16/**/*.nii.gz
+data/LUNA16/**/*.npy
+data/LUNA16/**/*.npz
+data/LUNA16/**/*.csv
+
+# --- Training outputs ---
+runs/
+logs/
+checkpoints/
+outputs/
+models/
+*.pth
+*.pt
+
+# --- Temporary or cache ---
+tmp/
+cache/
+*.tmp
