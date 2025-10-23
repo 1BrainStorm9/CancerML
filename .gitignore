@@ -35,6 +35,8 @@ data/LUNA16/**/*.csv
 
 # --- Training outputs ---
 runs/
+test/data/
+test/data/**/*.dcm
 logs/
 checkpoints/
 outputs/

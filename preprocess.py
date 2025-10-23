@@ -1,340 +1,167 @@
-"""
-Предобработка LUNA16 датасета:
-- Загрузка .mhd/.raw файлов
-- Ресэмплинг к spacing 1x1x1 мм
-- Клиппинг по HU диапазону [-1000, 400]
-- Нормализация интенсивностей
-- Изменение размера к 256x256x64
-- Создание масок узелков
-- Применение масок лёгких
-"""
-
 import os
-import pandas as pd
-import numpy as np
 from pathlib import Path
-from tqdm import tqdm
+import datetime
+import numpy as np
+import pandas as pd
 import SimpleITK as sitk
-from typing import Dict, List, Tuple
-import utils
+import pydicom
+from pydicom.dataset import FileDataset
+from scipy.ndimage import zoom
+from tqdm import tqdm
+
+# --- Параметры ---
+INPUT_DIR = Path('data/LUNA16/raw')
+ANNOTATIONS_PATH = Path('data/LUNA16/annotations.csv')
+OUTPUT_DIR = Path('data/LUNA16/processed')
+TARGET_SHAPE = (64, 256, 256)
+HU_MIN = -1000
+HU_MAX = 400
+TARGET_SPACING = (1.0, 1.0, 1.0)
+
+# Папки
+POS_DIR = OUTPUT_DIR / 'positive'
+NEG_DIR = OUTPUT_DIR / 'negative'
+IMAGES_POS_DIR = OUTPUT_DIR / 'images/positive'
+IMAGES_NEG_DIR = OUTPUT_DIR / 'images/negative'
+MASKS_POS_DIR = OUTPUT_DIR / 'masks/positive'
+MASKS_NEG_DIR = OUTPUT_DIR / 'masks/negative'
+
+for d in [POS_DIR, NEG_DIR, IMAGES_POS_DIR, IMAGES_NEG_DIR, MASKS_POS_DIR, MASKS_NEG_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
 
-class LUNA16Preprocessor:
-    """Класс для предобработки LUNA16 датасета."""
-    
-    def __init__(self,
-                 raw_data_dir: str,
-                 annotations_path: str,
-                 lung_masks_dir: str,
-                 output_dir: str,
-                 target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
-                 target_size: Tuple[int, int, int] = (64, 256, 256),  # (z, y, x)
-                 hu_min: float = -1000.0,
-                 hu_max: float = 400.0):
-        """
-        Args:
-            raw_data_dir: директория с .mhd/.raw файлами
-            annotations_path: путь к annotations.csv
-            lung_masks_dir: директория с масками лёгких
-            output_dir: директория для сохранения обработанных данных
-            target_spacing: целевой spacing (x, y, z) в мм
-            target_size: целевой размер (z, y, x)
-            hu_min: минимальное значение HU
-            hu_max: максимальное значение HU
-        """
-        self.raw_data_dir = Path(raw_data_dir)
-        self.annotations_path = annotations_path
-        self.lung_masks_dir = Path(lung_masks_dir)
-        self.output_dir = Path(output_dir)
-        self.target_spacing = np.array(target_spacing)  # (x, y, z)
-        self.target_size = target_size  # (z, y, x)
-        self.hu_min = hu_min
-        self.hu_max = hu_max
-        
-        # Создаём выходные директории
-        self.output_images_dir = self.output_dir / 'images'
-        self.output_masks_dir = self.output_dir / 'masks'
-        self.output_images_dir.mkdir(parents=True, exist_ok=True)
-        self.output_masks_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Загружаем аннотации
-        self.annotations = self._load_annotations()
-        
-    def _load_annotations(self) -> pd.DataFrame:
-        """Загрузка и группировка аннотаций по серии."""
-        df = pd.read_csv(self.annotations_path)
-        return df
-    
-    def _resample_image(self, image: sitk.Image, 
-                       new_spacing: np.ndarray) -> sitk.Image:
-        """
-        Ресэмплинг изображения к новому spacing.
-        
-        Args:
-            image: SimpleITK изображение
-            new_spacing: новый spacing (x, y, z)
-            
-        Returns:
-            resampled_image: ресэмплированное изображение
-        """
-        original_spacing = np.array(image.GetSpacing())
-        original_size = np.array(image.GetSize())
-        
-        # Вычисляем новый размер
-        new_size = (original_size * original_spacing / new_spacing).astype(int)
-        new_size = [int(s) for s in new_size]
-        
-        # Настраиваем resampler
-        resampler = sitk.ResampleImageFilter()
-        resampler.SetOutputSpacing(new_spacing.tolist())
-        resampler.SetSize(new_size)
-        resampler.SetOutputDirection(image.GetDirection())
-        resampler.SetOutputOrigin(image.GetOrigin())
-        resampler.SetTransform(sitk.Transform())
-        resampler.SetDefaultPixelValue(-1000)  # HU воздуха
-        resampler.SetInterpolator(sitk.sitkLinear)
-        
-        return resampler.Execute(image)
-    
-    def _resize_image(self, image: sitk.Image, 
-                     target_size: Tuple[int, int, int]) -> sitk.Image:
-        """
-        Изменение размера изображения к целевому размеру.
-        
-        Args:
-            image: SimpleITK изображение
-            target_size: целевой размер (x, y, z)
-            
-        Returns:
-            resized_image: изображение нового размера
-        """
-        original_size = image.GetSize()
-        original_spacing = np.array(image.GetSpacing())
-        
-        # Вычисляем новый spacing
-        new_spacing = (np.array(original_size) * original_spacing / 
-                      np.array(target_size))
-        
-        resampler = sitk.ResampleImageFilter()
-        resampler.SetOutputSpacing(new_spacing.tolist())
-        resampler.SetSize(target_size)
-        resampler.SetOutputDirection(image.GetDirection())
-        resampler.SetOutputOrigin(image.GetOrigin())
-        resampler.SetTransform(sitk.Transform())
-        resampler.SetDefaultPixelValue(-1000)
-        resampler.SetInterpolator(sitk.sitkLinear)
-        
-        return resampler.Execute(image)
-    
-    def _normalize_hu(self, image_array: np.ndarray) -> np.ndarray:
-        """
-        Нормализация HU значений.
-        
-        Args:
-            image_array: массив с HU значениями
-            
-        Returns:
-            normalized: нормализованный массив [0, 1]
-        """
-        # Клиппинг
-        image_array = np.clip(image_array, self.hu_min, self.hu_max)
-        
-        # Нормализация к [0, 1]
-        normalized = (image_array - self.hu_min) / (self.hu_max - self.hu_min)
-        
-        return normalized.astype(np.float32)
-    
-    def _update_annotations_for_new_params(self,
-                                          nodules: List[Dict],
-                                          original_origin: np.ndarray,
-                                          original_spacing: np.ndarray,
-                                          new_origin: np.ndarray,
-                                          new_spacing: np.ndarray) -> List[Dict]:
-        """
-        Обновление координат аннотаций после изменения spacing и размера.
-        
-        Args:
-            nodules: список аннотаций узелков
-            original_origin: исходный origin (x, y, z)
-            original_spacing: исходный spacing (x, y, z)
-            new_origin: новый origin (x, y, z)
-            new_spacing: новый spacing (x, y, z)
-            
-        Returns:
-            updated_nodules: обновлённые аннотации
-        """
-        updated_nodules = []
-        
-        for nodule in nodules:
-            # Исходные мировые координаты
-            world_coord = np.array([
-                nodule['coordX'],
-                nodule['coordY'],
-                nodule['coordZ']
-            ])
-            
-            # Конвертируем в voxel координаты исходного изображения
-            voxel_coord = utils.world_to_voxel_coords(
-                world_coord, original_origin, original_spacing
-            )
-            
-            # Конвертируем обратно в мировые с новыми параметрами
-            new_world_coord = utils.voxel_to_world_coords(
-                voxel_coord, new_origin, new_spacing
-            )
-            
-            updated_nodule = nodule.copy()
-            updated_nodule['coordX'] = new_world_coord[0]
-            updated_nodule['coordY'] = new_world_coord[1]
-            updated_nodule['coordZ'] = new_world_coord[2]
-            
-            updated_nodules.append(updated_nodule)
-        
-        return updated_nodules
-    
-    def process_single_scan(self, series_uid: str) -> bool:
-        """
-        Обработка одного КТ скана.
-        
-        Args:
-            series_uid: идентификатор серии
-            
-        Returns:
-            success: True если обработка успешна
-        """
-        try:
-            # Пути к файлам
-            mhd_path = self.raw_data_dir / f"{series_uid}.mhd"
-            lung_mask_path = self.lung_masks_dir / f"{series_uid}.mhd"
-            
-            if not mhd_path.exists():
-                print(f"Warning: {mhd_path} not found")
-                return False
-            
-            # Загружаем изображение
-            itk_image = sitk.ReadImage(str(mhd_path))
-            original_origin = np.array(itk_image.GetOrigin())
-            original_spacing = np.array(itk_image.GetSpacing())
-            
-            # Ресэмплинг к целевому spacing
-            resampled_image = self._resample_image(itk_image, self.target_spacing)
-            
-            # Изменение размера к целевому размеру (x, y, z)
-            target_size_xyz = (self.target_size[2], self.target_size[1], 
-                              self.target_size[0])
-            resized_image = self._resize_image(resampled_image, target_size_xyz)
-            
-            # Получаем новые параметры
-            new_origin = np.array(resized_image.GetOrigin())
-            new_spacing = np.array(resized_image.GetSpacing())
-            
-            # Конвертируем в numpy массив
-            image_array = sitk.GetArrayFromImage(resized_image)  # (z, y, x)
-            
-            # Применяем маску лёгких если доступна
-            if lung_mask_path.exists():
-                lung_mask_itk = sitk.ReadImage(str(lung_mask_path))
-                lung_mask_resampled = self._resample_image(
-                    lung_mask_itk, self.target_spacing
-                )
-                lung_mask_resized = self._resize_image(
-                    lung_mask_resampled, target_size_xyz
-                )
-                lung_mask_array = sitk.GetArrayFromImage(lung_mask_resized)
-                
-                # Применяем маску
-                image_array = utils.apply_lung_mask(image_array, lung_mask_array)
-            
-            # Нормализация
-            normalized_image = self._normalize_hu(image_array)
-            
-            # Получаем аннотации для этой серии
-            series_annotations = self.annotations[
-                self.annotations['seriesuid'] == series_uid
-            ]
-            
-            # Создаём список узелков
-            nodules = []
-            for _, row in series_annotations.iterrows():
-                nodules.append({
-                    'coordX': row['coordX'],
-                    'coordY': row['coordY'],
-                    'coordZ': row['coordZ'],
-                    'diameter_mm': row['diameter_mm']
-                })
-            
-            # Обновляем координаты узелков
-            updated_nodules = self._update_annotations_for_new_params(
-                nodules, original_origin, original_spacing,
-                new_origin, new_spacing
-            )
-            
-            # Создаём маску узелков
-            nodule_mask = utils.create_combined_nodule_mask(
-                self.target_size, updated_nodules, new_origin, new_spacing
-            )
-            
-            # Сохраняем обработанное изображение
-            output_image_path = self.output_images_dir / f"{series_uid}.npy"
-            np.save(output_image_path, normalized_image)
-            
-            # Сохраняем маску
-            output_mask_path = self.output_masks_dir / f"{series_uid}.npy"
-            np.save(output_mask_path, nodule_mask)
-            
-            # Сохраняем метаданные
-            metadata = {
-                'origin': new_origin.tolist(),
-                'spacing': new_spacing.tolist(),
-                'nodules': updated_nodules
-            }
-            metadata_path = self.output_dir / f"{series_uid}_metadata.npy"
-            np.save(metadata_path, metadata)
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error processing {series_uid}: {str(e)}")
-            return False
-    
-    def process_all(self):
-        """Обработка всех сканов в датасете."""
-        unique_series = self.annotations['seriesuid'].unique()
-        
-        print(f"Processing {len(unique_series)} scans...")
-        
-        successful = 0
-        for series_uid in tqdm(unique_series):
-            if self.process_single_scan(series_uid):
-                successful += 1
-        
-        print(f"\nProcessing complete: {successful}/{len(unique_series)} successful")
-        
-        # Сохраняем список обработанных файлов
-        processed_list = [
-            f"{series_uid}.npy" 
-            for series_uid in unique_series 
-            if (self.output_images_dir / f"{series_uid}.npy").exists()
-        ]
-        
-        list_path = self.output_dir / 'processed_files.txt'
-        with open(list_path, 'w') as f:
-            f.write('\n'.join(processed_list))
-        
-        print(f"Processed files list saved to: {list_path}")
+# --- Утилиты ---
+def load_itk_image(filename):
+    itk_image = sitk.ReadImage(str(filename))
+    image_array = sitk.GetArrayFromImage(itk_image)  # (D,H,W)
+    spacing = np.array(itk_image.GetSpacing())[::-1]
+    origin = np.array(itk_image.GetOrigin())[::-1]
+    return image_array, origin, spacing
+
+
+def resample_image(volume, original_spacing, new_spacing):
+    scale = original_spacing / np.array(new_spacing)
+    new_shape = (volume.shape * scale).astype(int)
+    resampled = zoom(volume, scale, order=1)
+    return resampled, scale
+
+
+def clip_and_normalize(volume, hu_min, hu_max):
+    volume = np.clip(volume, hu_min, hu_max)
+    volume = (volume - hu_min) / (hu_max - hu_min)
+    return volume.astype(np.float32)
+
+
+def save_dicom(volume, output_dir, series_uid):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for i, slice_data in enumerate(volume):
+        file_meta = pydicom.Dataset()
+        file_meta.MediaStorageSOPClassUID = pydicom.uid.SecondaryCaptureImageStorage
+        file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
+        file_meta.ImplementationClassUID = pydicom.uid.generate_uid()
+        file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+        ds = FileDataset(None, {}, file_meta=file_meta, preamble=b"\0" * 128)
+        ds.Modality = 'CT'
+        ds.SeriesInstanceUID = series_uid
+        ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+        ds.PatientName = "LUNA16"
+        ds.PatientID = "0001"
+        ds.ContentDate = str(datetime.date.today()).replace('-', '')
+        ds.Rows, ds.Columns = slice_data.shape
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = "MONOCHROME2"
+        ds.BitsStored = 16
+        ds.BitsAllocated = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 1
+        ds.InstanceNumber = i + 1
+        ds.PixelData = slice_data.astype(np.int16).tobytes()
+        ds.is_little_endian = True
+        ds.is_implicit_VR = False
+        ds.save_as(output_dir / f"slice_{i:03d}.dcm", write_like_original=False)
+
+
+def process_case(case_id, annotations):
+    mhd_file = INPUT_DIR / f"{case_id}.mhd"
+    if not mhd_file.exists():
+        print(f"⚠ Файл {mhd_file} не найден")
+        return []
+
+    volume, origin, spacing = load_itk_image(mhd_file)
+    volume_resampled, scale = resample_image(volume, spacing, TARGET_SPACING)
+    volume_resized = zoom(volume_resampled, np.array(TARGET_SHAPE) / np.array(volume_resampled.shape), order=1)
+
+    # Клиппинг и нормализация
+    volume_norm = clip_and_normalize(volume_resized, HU_MIN, HU_MAX)
+
+    # Определяем позитив/негатив
+    is_positive = case_id in annotations['seriesuid'].values
+
+    dicom_dir = POS_DIR / case_id if is_positive else NEG_DIR / case_id
+    save_dicom(volume_resized, dicom_dir, case_id)
+
+    # Сохраняем изображение в соответствующую папку
+    img_dir = IMAGES_POS_DIR if is_positive else IMAGES_NEG_DIR
+    np.save(img_dir / f"{case_id}.npy", volume_norm)
+
+    # Создание маски узелков
+    coords_new = []
+    mask_dir = MASKS_POS_DIR if is_positive else MASKS_NEG_DIR
+    mask = np.zeros(TARGET_SHAPE, dtype=np.uint8)
+    if is_positive:
+        series_ann = annotations[annotations['seriesuid'] == case_id]
+        for _, row in series_ann.iterrows():
+            z = int((row['coordZ'] - origin[0]) / spacing[0] * scale[0])
+            y = int((row['coordY'] - origin[1]) / spacing[1] * scale[1])
+            x = int((row['coordX'] - origin[2]) / spacing[2] * scale[2])
+            z = np.clip(z, 0, TARGET_SHAPE[0]-1)
+            y = np.clip(y, 0, TARGET_SHAPE[1]-1)
+            x = np.clip(x, 0, TARGET_SHAPE[2]-1)
+            mask[z, y, x] = 1
+            coords_new.append([case_id, z, y, x])
+    # Сохраняем маску
+    np.save(mask_dir / f"{case_id}.npy", mask)
+
+    return coords_new
+
+
+def split_positive_negative():
+    positive_files = [f.name for f in IMAGES_POS_DIR.glob("*.npy")]
+    negative_files = [f.name for f in IMAGES_NEG_DIR.glob("*.npy")]
+    print(f"Найдено {len(positive_files)} позитивных и {len(negative_files)} негативных образцов.")
+    return positive_files, negative_files
+
+
+def main():
+    annotations = pd.read_csv(ANNOTATIONS_PATH) if ANNOTATIONS_PATH.exists() else pd.DataFrame(columns=['seriesuid','coordZ','coordY','coordX'])
+    all_coords = []
+
+    mhd_files = list(INPUT_DIR.glob("*.mhd"))
+    if not mhd_files:
+        print("❌ Нет .mhd файлов для обработки!")
+        return
+
+    for f in tqdm(mhd_files, desc="Processing scans"):
+        case_id = f.stem
+        coords = process_case(case_id, annotations)
+        all_coords.extend(coords)
+
+    # Сохраняем пересчитанные аннотации для позитивных КТ
+    df_coords = pd.DataFrame(all_coords, columns=['seriesuid', 'coordZ', 'coordY', 'coordX'])
+    df_coords.to_csv(POS_DIR / 'annotations_rescaled.csv', index=False)
+
+    # Статистика
+    pos_count = len(list(IMAGES_POS_DIR.glob("*.npy")))
+    neg_count = len(list(IMAGES_NEG_DIR.glob("*.npy")))
+    print(f"\n✅ Конвертация завершена")
+    print(f"Позитивные КТ: {pos_count}")
+    print(f"Негативные КТ: {neg_count}")
+    print(f"Изображения позитивные сохранены в: {IMAGES_POS_DIR}")
+    print(f"Изображения негативные сохранены в: {IMAGES_NEG_DIR}")
+    print(f"Маски позитивные сохранены в: {MASKS_POS_DIR}")
+    print(f"Маски негативные сохранены в: {MASKS_NEG_DIR}")
 
 
 if __name__ == '__main__':
-    # Пример использования
-    preprocessor = LUNA16Preprocessor(
-        raw_data_dir='data/LUNA16/raw',
-        annotations_path='data/LUNA16/annotations.csv',
-        lung_masks_dir='data/LUNA16/seg-lungs-LUNA16',
-        output_dir='data/LUNA16/processed',
-        target_spacing=(1.0, 1.0, 1.0),
-        target_size=(64, 256, 256),
-        hu_min=-1000.0,
-        hu_max=400.0
-    )
-    
-    preprocessor.process_all()
+    main()
