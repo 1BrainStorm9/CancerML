@@ -164,103 +164,57 @@ def create_combined_nodule_mask(shape: Tuple[int, int, int],
     return combined_mask
 
 
-def dice_coefficient(pred: torch.Tensor, target: torch.Tensor, 
-                    smooth: float = 1e-6) -> float:
+
+def dice_coefficient(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6):
     """
-    Вычисление Dice coefficient.
-    
-    Args:
-        pred: предсказанная маска (B, C, D, H, W) или (D, H, W)
-        target: ground truth маска
-        smooth: smoothing factor
-        
-    Returns:
-        dice: Dice coefficient
+    pred: probabilities or binary (B,1,D,H,W) or (B,D,H,W)
+    target: binary (same shape)
+    returns mean dice over batch
     """
-    pred = pred.flatten()
-    target = target.flatten()
-    
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum()
-    
+    pred = pred.float()
+    target = target.float()
+    if pred.dim() == 5:
+        pred = pred.view(pred.size(0), -1)
+        target = target.view(target.size(0), -1)
+    else:
+        pred = pred.view(1, -1)
+        target = target.view(1, -1)
+    intersection = (pred * target).sum(dim=1)
+    union = pred.sum(dim=1) + target.sum(dim=1)
     dice = (2.0 * intersection + smooth) / (union + smooth)
-    return dice.item()
+    return dice.mean().item()
 
 
-def sensitivity_score(pred: torch.Tensor, target: torch.Tensor,
-                     smooth: float = 1e-6) -> float:
-    """
-    Вычисление Sensitivity (Recall, True Positive Rate).
-    
-    Args:
-        pred: предсказанная маска
-        target: ground truth маска
-        smooth: smoothing factor
-        
-    Returns:
-        sensitivity: чувствительность
-    """
-    pred = pred.flatten()
-    target = target.flatten()
-    
-    true_positive = (pred * target).sum()
-    actual_positive = target.sum()
-    
-    sensitivity = (true_positive + smooth) / (actual_positive + smooth)
-    return sensitivity.item()
+def sensitivity_score(pred: torch.Tensor, target: torch.Tensor, eps=1e-6):
+    pred = pred.float()
+    target = target.float()
+    tp = (pred * target).sum()
+    fn = ((1 - pred) * target).sum()
+    return (tp / (tp + fn + eps)).item()
+
+def precision_score(pred: torch.Tensor, target: torch.Tensor, eps=1e-6):
+    pred = pred.float()
+    target = target.float()
+    tp = (pred * target).sum()
+    fp = (pred * (1 - target)).sum()
+    return (tp / (tp + fp + eps)).item()
 
 
-def precision_score(pred: torch.Tensor, target: torch.Tensor,
-                   smooth: float = 1e-6) -> float:
-    """
-    Вычисление Precision (Positive Predictive Value).
-    
-    Args:
-        pred: предсказанная маска
-        target: ground truth маска
-        smooth: smoothing factor
-        
-    Returns:
-        precision: точность
-    """
-    pred = pred.flatten()
-    target = target.flatten()
-    
-    true_positive = (pred * target).sum()
-    predicted_positive = pred.sum()
-    
-    precision = (true_positive + smooth) / (predicted_positive + smooth)
-    return precision.item()
-
-
-def save_checkpoint(model: torch.nn.Module, optimizer: torch.optim.Optimizer,
-                   epoch: int, loss: float, metrics: Dict,
-                   filepath: str, scheduler=None):
-    """
-    Сохранение чекпоинта модели.
-    
-    Args:
-        model: модель
-        optimizer: оптимизатор
-        epoch: номер эпохи
-        loss: значение loss
-        metrics: словарь с метриками
-        filepath: путь для сохранения
-        scheduler: планировщик lr (опционально)
-    """
-    checkpoint = {
+def save_checkpoint(model, optimizer, epoch, loss, metrics, filepath, scheduler=None):
+    data = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
         'metrics': metrics
     }
-    
     if scheduler is not None:
-        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-    
-    torch.save(checkpoint, filepath)
-    print(f"Checkpoint saved: {filepath}")
+        try:
+            data['scheduler_state_dict'] = scheduler.state_dict()
+        except Exception:
+            pass
+    torch.save(data, filepath)
+    print(f"Saved checkpoint: {filepath}")
 
 
 def load_checkpoint(filepath: str, model: torch.nn.Module,

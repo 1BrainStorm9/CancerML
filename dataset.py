@@ -1,230 +1,174 @@
 import os
 import numpy as np
+from glob import glob
+from torch.utils.data import Dataset, DataLoader
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from pathlib import Path
-from typing import Tuple, Dict, List
+
+
 from monai.transforms import (
-    Compose, RandFlipd, RandGaussianNoised,
-    RandScaleIntensityd, RandShiftIntensityd, RandAffined, Resize
+    Compose,
+    EnsureChannelFirstd,
+    RandFlipd,
+    RandAffined,
+    RandCropByPosNegLabeld,
+    NormalizeIntensityd,
+    EnsureTyped,
 )
 
-# ======================================================
-# Вспомогательная функция
-# ======================================================
-def split_positive_negative(data_dir: str):
-    """Разделяет файлы на позитивные (с узелками) и негативные (без узелков)."""
-    IMAGES_POS_DIR = Path(data_dir) / "images/positive"
-    IMAGES_NEG_DIR = Path(data_dir) / "images/negative"
 
-    positive_files = [f.name for f in IMAGES_POS_DIR.glob("*.npy")]
-    negative_files = [f.name for f in IMAGES_NEG_DIR.glob("*.npy")]
-
-    print(f"✅ Найдено {len(positive_files)} позитивных и {len(negative_files)} негативных образцов.")
-    return positive_files, negative_files
-
-
-# ======================================================
-# Класс датасета
-# ======================================================
-class LUNA16Dataset(Dataset):
-    """Dataset для обработанных LUNA16 сканов с аугментациями."""
-
-    def __init__(self, data_dir: str, file_list: List[str],
-                 augmentation: bool = True, cache: bool = False):
-        self.data_dir = Path(data_dir)
-        self.IMAGES_POS_DIR = self.data_dir / "images/positive"
-        self.IMAGES_NEG_DIR = self.data_dir / "images/negative"
-        self.MASKS_POS_DIR = self.data_dir / "masks/positive"
-        self.MASKS_NEG_DIR = self.data_dir / "masks/negative"
-
-        self.file_list = file_list
-        self.augmentation = augmentation
+class Luna16Dataset(Dataset):
+    def __init__(self, image_dir, mask_dir, augment=True, crop_shape=(64, 256, 256), cache=False):
+        super().__init__()
+        self.image_paths = sorted(glob(os.path.join(image_dir, "*.npy")))
+        self.mask_paths = sorted(glob(os.path.join(mask_dir, "*.npy")))
+        assert len(self.image_paths) == len(self.mask_paths), "Images and masks mismatch!"
+        self.augment = augment
+        self.crop_shape = crop_shape
         self.cache = cache
-        self.cached_data = {} if cache else None
 
-        self.transforms = self._get_transforms() if augmentation else None
+        self.transforms = self._build_transforms()
 
-        # Фиксированная целевая форма
-        self.target_shape = (64, 256, 256)
-        self.resizer = Resize(self.target_shape, mode="nearest")
+        if cache:
+            print("⚙️ Caching dataset in memory...")
+            self.data = []
+            for img_p, msk_p in zip(self.image_paths, self.mask_paths):
+                self.data.append({
+                    "image": np.load(img_p).astype(np.float32),
+                    "mask": np.load(msk_p).astype(np.uint8)
+                })
+            print(f"✅ Cached {len(self.data)} samples in RAM.")
 
-    def _get_transforms(self):
-        return Compose([
-            RandFlipd(keys=['image', 'mask'], prob=0.5, spatial_axis=0),
-            RandFlipd(keys=['image', 'mask'], prob=0.5, spatial_axis=1),
-            RandFlipd(keys=['image', 'mask'], prob=0.5, spatial_axis=2),
-            RandGaussianNoised(keys=['image'], prob=0.3, mean=0.0, std=0.05),
-            RandScaleIntensityd(keys=['image'], factors=0.1, prob=0.3),
-            RandShiftIntensityd(keys=['image'], offsets=0.1, prob=0.3),
-            RandAffined(
-                keys=['image', 'mask'],
-                prob=0.3,
-                rotate_range=(0.1, 0.1, 0.1),
-                scale_range=(0.1, 0.1, 0.1),
-                mode=['bilinear', 'nearest'],
-                padding_mode='border'
-            )
-        ])
+    def _build_transforms(self):
+        base = [
+            EnsureChannelFirstd(keys=["image", "mask"], channel_dim="no_channel"),
+            NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
+        ]
 
-    def __len__(self) -> int:
-        return len(self.file_list)
+        if self.augment:
+            base.extend([
+                RandCropByPosNegLabeld(
+                    keys=["image", "mask"],
+                    label_key="mask",
+                    spatial_size=self.crop_shape,
+                    pos=1,
+                    neg=1,
+                    num_samples=1,
+                    allow_smaller=True
+                ),
+                RandFlipd(keys=["image", "mask"], prob=0.5, spatial_axis=0),
+                RandFlipd(keys=["image", "mask"], prob=0.5, spatial_axis=1),
+                RandFlipd(keys=["image", "mask"], prob=0.5, spatial_axis=2),
+                RandAffined(
+                    keys=["image", "mask"],
+                    prob=0.3,
+                    rotate_range=(0.1, 0.1, 0.1),
+                    scale_range=(0.1, 0.1, 0.1),
+                    mode=("bilinear", "nearest")
+                ),
+            ])
+        base.append(EnsureTyped(keys=["image", "mask"]))
+        return Compose(base)
 
-    def _normalize_shape(self, array: np.ndarray) -> np.ndarray:
-        """Приводим массив к форме (64, 256, 256) с помощью MONAI Resize."""
-        array = array.astype(np.float32)
-        # Добавляем временный канал для Resize
-        array = array[np.newaxis, ...]  # (1,D,H,W)
-        if array.shape[1:] != self.target_shape:
-            array = self.resizer(array)
-        # Убираем канал, чтобы получить (D,H,W)
-        array = array[0]
-        return array.astype(np.float32)
+    def __len__(self):
+        return len(self.image_paths)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        filename = self.file_list[idx]
-
-        if self.cache and filename in self.cached_data:
-            image, mask = self.cached_data[filename]
+    def __getitem__(self, idx):
+        if self.cache:
+            data = self.data[idx].copy()
         else:
-            if (self.IMAGES_POS_DIR / filename).exists():
-                image_path = self.IMAGES_POS_DIR / filename
-                mask_path = self.MASKS_POS_DIR / filename
-            else:
-                image_path = self.IMAGES_NEG_DIR / filename
-                mask_path = self.MASKS_NEG_DIR / filename
+            img = np.load(self.image_paths[idx]).astype(np.float32)
+            msk = np.load(self.mask_paths[idx]).astype(np.uint8)
+            data = {"image": img, "mask": msk}
 
-            image = np.load(image_path)
-            mask = np.load(mask_path)
-
-            # Приведение формы к (D,H,W)
-            image = self._normalize_shape(image)
-            mask = self._normalize_shape(mask)
-            mask = (mask > 0).astype(np.uint8)
-
-            if self.cache:
-                self.cached_data[filename] = (image.copy(), mask.copy())
-
-        # --- Добавляем канал перед трансформациями ---
-        data_dict = {'image': image[np.newaxis, ...], 'mask': mask[np.newaxis, ...]}  # (1,D,H,W)
-
-        # Применяем аугментации
-        if self.transforms is not None:
-            try:
-                data_dict = self.transforms(data_dict)
-            except IndexError:
-                print(f"Warning: skipping augmentation for {filename} due to small shape {image.shape}")
-
-        # --- В результате получаем (1,D,H,W) ---
-        image = data_dict['image'].astype(np.float32)
-        mask = data_dict['mask'].astype(np.float32)
-
-        return {
-            'image': torch.as_tensor(image, dtype=torch.float32),
-            'mask': torch.as_tensor(mask, dtype=torch.float32)
-        }
+        data = self.transforms(data)
+        
+        if isinstance(data, list):
+            data = data[0]
+        
+        return data["image"], data["mask"]
 
 
-# ======================================================
-# Создание DataLoader'ов
-# ======================================================
-def get_dataloaders(data_dir: str,
-                    train_split: float = 0.8,
-                    batch_size: int = 2,
-                    num_workers: int = 4,
-                    cache_train: bool = False,
-                    cache_val: bool = False) -> Tuple[DataLoader, DataLoader]:
+def get_dataloaders(train_img_dir, train_mask_dir, val_img_dir, val_mask_dir,
+                    batch_size=1, crop_shape=(64, 256, 256),
+                    num_workers=4, augment=True):
+    train_ds = Luna16Dataset(train_img_dir, train_mask_dir, augment=augment, crop_shape=crop_shape)
+    val_ds = Luna16Dataset(val_img_dir, val_mask_dir, augment=False, crop_shape=crop_shape)
 
-    positive_files, negative_files = split_positive_negative(data_dir)
-
-    all_files = positive_files + negative_files
-    np.random.shuffle(all_files)
-
-    split_idx = int(len(all_files) * train_split)
-    train_files = all_files[:split_idx]
-    val_files = all_files[split_idx:]
-
-    print(f"Train samples: {len(train_files)}, Validation samples: {len(val_files)}")
-
-    train_dataset = LUNA16Dataset(data_dir, train_files, augmentation=True, cache=cache_train)
-    val_dataset = LUNA16Dataset(data_dir, val_files, augmentation=False, cache=cache_val)
-
-    # === WeightedRandomSampler для баланса классов ===
-    labels = [1 if "positive" in str(f) else 0 for f in train_dataset.file_list]
-    class_counts = np.bincount(labels)
-    class_weights = 1.0 / class_counts
-    sample_weights = [class_weights[label] for label in labels]
-
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
-
-    use_cuda = torch.cuda.is_available()
-    if not use_cuda:
-        num_workers = 0
-        pin_memory = False
-        persistent_workers = False
-    else:
-        pin_memory = True
-        persistent_workers = num_workers > 0
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers
-    )
-
-    # ======================================================
-    # Тестируем первый батч
-    # ======================================================
-    print("\nTesting dataloader...")
-    sample = next(iter(train_loader))
-    print(f"Image shape: {sample['image'].shape}")
-    print(f"Mask shape: {sample['mask'].shape}")
-    print(f"Image range: [{sample['image'].min():.3f}, {sample['image'].max():.3f}]")
-    print(f"Mask unique values: {torch.unique(sample['mask'])}")
-
-    # ======================================================
-    # Проверка баланса по всем батчам
-    # ======================================================
-    pos_count = 0
-    neg_count = 0
-    for batch in train_loader:
-        masks = batch['mask']
-        for m in masks:
-            if m.sum() > 0:
-                pos_count += 1
-            else:
-                neg_count += 1
-    total = pos_count + neg_count
-    print(f"\nБаланс в train_loader по всем батчам:")
-    print(f"Позитивные: {pos_count} ({pos_count/total*100:.2f}%)")
-    print(f"Негативные: {neg_count} ({neg_count/total*100:.2f}%)")
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=num_workers)
 
     return train_loader, val_loader
 
 
-# ======================================================
-# Тестирование
-# ======================================================
-if __name__ == '__main__':
+if __name__ == "__main__":
     train_loader, val_loader = get_dataloaders(
-        data_dir='data/LUNA16/processed',
-        train_split=0.8,
-        batch_size=2,
-        num_workers=2
+        train_img_dir="data/LUNA16/processed/images/positive",
+        train_mask_dir="data/LUNA16/processed/masks/positive",
+        val_img_dir="data/LUNA16/processed/images/negative",
+        val_mask_dir="data/LUNA16/processed/masks/negative",
+        batch_size=1,
+        crop_shape=(64, 256, 256),
+        augment=True,
     )
+
+    # Статистика датасета ДО трансформаций
+    print("\n" + "="*60)
+    print("📊 Статистика ИСХОДНОГО датасета:")
+    print("="*60)
+    print(f"✅ Положительные КТ (с узелками): {len(train_loader.dataset)} файлов")
+    print(f"❌ Отрицательные КТ (без узелков): {len(val_loader.dataset)} файлов")
+    print(f"📦 Всего КТ: {len(train_loader.dataset) + len(val_loader.dataset)} файлов")
+    print("="*60 + "\n")
+
+    # Подсчет положительных/отрицательных ПОСЛЕ трансформаций
+    print("⏳ Анализ датасета после трансформаций (это может занять время)...\n")
+    
+    def analyze_dataset(loader, name):
+        positive_count = 0
+        negative_count = 0
+        total_nodule_voxels = 0
+        
+        for img, mask in loader:
+            has_nodules = (mask.sum() > 0).item()
+            if has_nodules:
+                positive_count += 1
+                total_nodule_voxels += mask.sum().item()
+            else:
+                negative_count += 1
+        
+        print(f"📈 {name}:")
+        print(f"  ✅ Положительные патчи (с узелками): {positive_count}")
+        print(f"  ❌ Отрицательные патчи (без узелков): {negative_count}")
+        print(f"  📊 Соотношение pos/neg: {positive_count}/{negative_count} = {positive_count/(negative_count+1e-6):.2f}")
+        if positive_count > 0:
+            print(f"  🎯 Среднее вокселей узелков на патч: {total_nodule_voxels/positive_count:.1f}")
+        print()
+        
+        return positive_count, negative_count
+    
+    train_pos, train_neg = analyze_dataset(train_loader, "Train (positive КТ)")
+    val_pos, val_neg = analyze_dataset(val_loader, "Val (negative КТ)")
+    
+    print("="*60)
+    print("📊 ИТОГОВАЯ СТАТИСТИКА ПОСЛЕ ТРАНСФОРМАЦИЙ:")
+    print("="*60)
+    print(f"✅ Всего положительных патчей: {train_pos + val_pos}")
+    print(f"❌ Всего отрицательных патчей: {train_neg + val_neg}")
+    print(f"📦 Всего патчей: {train_pos + val_pos + train_neg + val_neg}")
+    print(f"⚖️  Баланс классов: {(train_pos + val_pos)/(train_pos + val_pos + train_neg + val_neg)*100:.1f}% positive")
+    print("="*60 + "\n")
+
+    # Пример батча
+    print("🔍 Пример батча из train:")
+    for img, mask in train_loader:
+        print(f"  Image shape: {img.shape}")
+        print(f"  Mask shape: {mask.shape}")
+        print(f"  Unique mask values: {torch.unique(mask).tolist()}")
+        print(f"  Image range: [{img.min():.3f}, {img.max():.3f}]")
+        
+        has_nodules = (mask.sum() > 0).item()
+        print(f"  Содержит узелки: {'Да ✓' if has_nodules else 'Нет ✗'}")
+        if has_nodules:
+            print(f"  Количество вокселей с узелками: {mask.sum().item():.0f}")
+        break

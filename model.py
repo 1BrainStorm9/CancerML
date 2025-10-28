@@ -1,188 +1,131 @@
 """
-3D U-Net модель для сегментации узелков в КТ-снимках лёгких.
-Использует MONAI для реализации архитектуры.
+Improved 3D Attention U-Net for lung nodule segmentation (LUNA16)
+Includes:
+ - Attention gates
+ - Residual connections
+ - Instance normalization (stable for small batches)
+ - DropBlock (Dropout3D)
+ - Refinement conv head
 """
 
 import torch
 import torch.nn as nn
-from monai.networks.nets import UNet
+from monai.networks.nets import AttentionUnet
 from monai.networks.layers import Norm
 from typing import Tuple
 
 
-class LungNodule3DUNet(nn.Module):
-    """3D U-Net для сегментации узелков лёгких."""
-    
+# ======================================================
+# Residual Conv Block
+# ======================================================
+class ResidualConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, norm='instance'):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size, padding=1, bias=False)
+        self.norm1 = nn.InstanceNorm3d(out_channels) if norm == 'instance' else nn.BatchNorm3d(out_channels)
+        self.act1 = nn.PReLU()
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size, padding=1, bias=False)
+        self.norm2 = nn.InstanceNorm3d(out_channels) if norm == 'instance' else nn.BatchNorm3d(out_channels)
+        self.act2 = nn.PReLU()
+
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.act1(out)
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out += identity
+        out = self.act2(out)
+        return out
+
+
+# ======================================================
+# Main Model: Attention ResUNet 3D
+# ======================================================
+class LungNoduleAttentionResUNet3D(nn.Module):
     def __init__(self,
                  in_channels: int = 1,
                  out_channels: int = 1,
-                 channels: Tuple[int, ...] = (32, 64, 128, 256, 512),
+                 channels: Tuple[int, ...] = (16, 32, 64, 128, 256),
                  strides: Tuple[int, ...] = (2, 2, 2, 2),
-                 num_res_units: int = 2,
-                 dropout: float = 0.0):
-        """
-        Args:
-            in_channels: количество входных каналов
-            out_channels: количество выходных каналов
-            channels: количество каналов на каждом уровне
-            strides: шаги для downsampling
-            num_res_units: количество residual units
-            dropout: вероятность dropout
-        """
+                 dropout: float = 0.2,
+                 use_refine: bool = True,
+                 use_residual: bool = True):
         super().__init__()
-        
-        self.unet = UNet(
+
+        # MONAI AttentionUnet without 'norm' argument
+        self.unet = AttentionUnet(
             spatial_dims=3,
             in_channels=in_channels,
             out_channels=out_channels,
             channels=channels,
             strides=strides,
-            num_res_units=num_res_units,
-            norm=Norm.BATCH,
-            dropout=dropout,
-            act='PRELU'
+            # norm=Norm.INSTANCE,  # Убираем, MONAI больше не принимает norm
         )
-        
+
+        # optional residual refinement head
+        self.use_residual = use_residual
+        self.residual_block = ResidualConvBlock(out_channels, out_channels) if use_residual else nn.Identity()
+
+        # spatial dropout
+        self.drop_block = nn.Dropout3d(p=dropout)
+
+        # optional refinement convolution
+        self.refine = nn.Sequential(
+            nn.Conv3d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_channels),
+            nn.PReLU(),
+            nn.Conv3d(out_channels, out_channels, 3, padding=1)
+        ) if use_refine else nn.Identity()
+
+        self.final_act = nn.Identity()  # keep logits, activation handled in loss
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            x: входной тензор (B, C, D, H, W)
-            
-        Returns:
-            output: предсказанная маска (B, C, D, H, W)
-        """
-        return self.unet(x)
+        x = self.unet(x)
+        x = self.residual_block(x)
+        x = self.drop_block(x)
+        x = self.refine(x)
+        x = self.final_act(x)
+        return x
 
 
-class DiceBCELoss(nn.Module):
-    """Комбинированный Dice + BCE Loss."""
-    
-    def __init__(self, 
-                 dice_weight: float = 0.5,
-                 bce_weight: float = 0.5,
-                 smooth: float = 1e-6):
-        """
-        Args:
-            dice_weight: вес для Dice loss
-            bce_weight: вес для BCE loss
-            smooth: сглаживание для Dice
-        """
-        super().__init__()
-        self.dice_weight = dice_weight
-        self.bce_weight = bce_weight
-        self.smooth = smooth
-        self.bce = nn.BCEWithLogitsLoss()
-        
-    def dice_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Вычисление Dice loss.
-        
-        Args:
-            pred: предсказания (B, C, D, H, W) - логиты
-            target: ground truth (B, C, D, H, W)
-            
-        Returns:
-            loss: Dice loss
-        """
-        pred = torch.sigmoid(pred)
-        
-        # Flatten
-        pred = pred.view(-1)
-        target = target.view(-1)
-        
-        intersection = (pred * target).sum()
-        union = pred.sum() + target.sum()
-        
-        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        
-        return 1.0 - dice
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Комбинированный loss.
-        
-        Args:
-            pred: предсказания (логиты)
-            target: ground truth
-            
-        Returns:
-            combined_loss
-        """
-        dice = self.dice_loss(pred, target)
-        bce = self.bce(pred, target)
-        
-        return self.dice_weight * dice + self.bce_weight * bce
-
-
+# ======================================================
+# Utility functions
+# ======================================================
 def create_model(device: str = 'cuda',
-                pretrained_path: str = None) -> nn.Module:
-    """
-    Создание и инициализация модели.
-    
-    Args:
-        device: устройство для модели
-        pretrained_path: путь к предобученным весам (опционально)
-        
-    Returns:
-        model: инициализированная модель
-    """
-    model = LungNodule3DUNet(
-        in_channels=1,
-        out_channels=1,
-        channels=(32, 64, 128, 256, 512),
-        strides=(2, 2, 2, 2),
-        num_res_units=2,
-        dropout=0.1
-    )
-    
+                 pretrained_path: str = None,
+                 **kwargs) -> nn.Module:
+    model = LungNoduleAttentionResUNet3D(**kwargs)
     if pretrained_path is not None:
         print(f"Loading pretrained weights from {pretrained_path}")
         checkpoint = torch.load(pretrained_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
-    
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model = model.to(device)
-    
     return model
 
 
 def count_parameters(model: nn.Module) -> int:
-    """
-    Подсчёт количества обучаемых параметров.
-    
-    Args:
-        model: модель
-        
-    Returns:
-        num_params: количество параметров
-    """
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-if __name__ == '__main__':
-    # Тест модели
+# ======================================================
+# Debug / self-test
+# ======================================================
+if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
-    
-    model = create_model(device=device)
-    
-    print(f"\nModel parameters: {count_parameters(model):,}")
-    
-    # Тестовый forward pass
-    batch_size = 2
-    x = torch.randn(batch_size, 1, 64, 256, 256).to(device)
-    
-    print(f"\nInput shape: {x.shape}")
-    
+    model = create_model(device=device,
+                         in_channels=1,
+                         out_channels=1,
+                         channels=(16, 32, 64, 128, 256),
+                         dropout=0.2)
+    print(f"Model parameters: {count_parameters(model):,}")
+    x = torch.randn(1, 1, 64, 128, 128).to(device)
     with torch.no_grad():
-        output = model(x)
-    
-    print(f"Output shape: {output.shape}")
-    
-    # Тест loss
-    criterion = DiceBCELoss()
-    target = torch.randint(0, 2, (batch_size, 1, 64, 256, 256)).float().to(device)
-    
-    loss = criterion(output, target)
-    print(f"\nLoss: {loss.item():.4f}")
+        y = model(x)
+    print("Input:", tuple(x.shape), "Output:", tuple(y.shape))
